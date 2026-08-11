@@ -1,0 +1,188 @@
+---
+name: Docker Cleanup
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: skyhisi/get_iplayer
+  KEEP_COUNT: "10"
+  PROTECTED_TAGS: "latest"
+
+concurrency:
+  group: docker-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Create Docker Hub API token
+        id: hub_auth
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          response=$(curl -fsSL -X POST https://hub.docker.com/v2/auth/token \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -cn --arg identifier \"$DOCKERHUB_USERNAME\" --arg secret \"$DOCKERHUB_TOKEN\" '{identifier: $identifier, secret: $secret}')")
+
+          token=$(jq -r '.access_token // empty' <<<"$response")
+          [[ -n "$token" ]] || {
+            echo "Failed to create Docker Hub API token" >&2
+            exit 1
+          }
+
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Create Docker registry token
+        id: registry_auth
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          response=$(curl -fsSL --user "$DOCKERHUB_USERNAME:$DOCKERHUB_TOKEN" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_NAME}:pull,delete")
+
+          token=$(jq -r '.token // .access_token // empty' <<<"$response")
+          [[ -n "$token" ]] || {
+            echo "Failed to create Docker registry token" >&2
+            exit 1
+          }
+
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Select tags to delete
+        id: select
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          KEEP_COUNT: ${{ env.KEEP_COUNT }}
+          PROTECTED_TAGS: ${{ env.PROTECTED_TAGS }}
+          DOCKERHUB_TOKEN: ${{ steps.hub_auth.outputs.token }}
+          REGISTRY_TOKEN: ${{ steps.registry_auth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          accept_header='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+
+          api_url="https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags?page_size=100"
+          tags_json='[]'
+
+          while [[ -n "$api_url" && "$api_url" != "null" ]]; do
+            response=$(curl -fsSL "$api_url" \
+              -H "Authorization: Bearer $DOCKERHUB_TOKEN")
+            page_tags=$(jq -c '[.results[] | {name, last_updated}]' <<<"$response")
+            tags_json=$(jq -c --argjson current "$tags_json" --argjson page "$page_tags" '$current + $page' <<<"null")
+            api_url=$(jq -r '.next // empty' <<<"$response")
+          done
+
+          tags_with_digests=$(jq -c '[]' <<<"null")
+          while IFS= read -r tag_entry; do
+            tag_name=$(jq -r '.name' <<<"$tag_entry")
+            digest=$(curl -fsSI \
+              -H "Authorization: Bearer $REGISTRY_TOKEN" \
+              -H "Accept: ${accept_header}" \
+              "https://registry-1.docker.io/v2/${IMAGE_NAME}/manifests/${tag_name}" \
+              | tr -d '\r' \
+              | awk 'BEGIN { IGNORECASE = 1 } /^docker-content-digest:/ { print $2 }')
+
+            [[ -n "$digest" ]] || {
+              echo "Failed to resolve digest for ${IMAGE_NAME}:${tag_name}" >&2
+              exit 1
+            }
+
+            tags_with_digests=$(jq -c \
+              --argjson current "$tags_with_digests" \
+              --argjson tag "$tag_entry" \
+              --arg digest "$digest" \
+              '$current + [$tag + {digest: $digest}]' <<<"null")
+          done < <(jq -c '.[]' <<<"$tags_json")
+
+          sorted_tags=$(jq -c 'sort_by(.last_updated) | reverse' <<<"$tags_with_digests")
+          protected_tags=$(printf '%s\n' "$PROTECTED_TAGS" | sed '/^$/d' | jq -R . | jq -sc '.')
+          keepers=$(jq -c --argjson keep_count "$KEEP_COUNT" --argjson protected "$protected_tags" '((.[0:$keep_count] | map(.name)) + $protected) | unique' <<<"$sorted_tags")
+
+          deletable_info=$(jq -c --argjson keepers "$keepers" '
+            reduce .[] as $tag (
+              {deleteTags: [], deleteDigests: [], skippedTags: []};
+              .digestTags = ((.digestTags // {}) + {
+                ($tag.digest): (((.digestTags // {})[$tag.digest] // []) + [$tag.name])
+              })
+            )
+            | .digestTags as $digestTags
+            | reduce ($digestTags | to_entries[]) as $entry (.;
+                ($entry.value | map(select(($keepers | index(.)) != null))) as $keptRefs
+                | ($entry.value | map(select(($keepers | index(.)) == null))) as $oldRefs
+                | if ($oldRefs | length) == 0 then .
+                  elif ($keptRefs | length) == 0 then
+                    .deleteTags += $oldRefs
+                    | .deleteDigests += [$entry.key]
+                  else
+                    .skippedTags += ($oldRefs | map({name: ., digest: $entry.key, kept_refs: $keptRefs}))
+                  end
+              )
+            | {deleteTags: (.deleteTags | unique), deleteDigests: (.deleteDigests | unique), skippedTags}
+          ' <<<"$sorted_tags")
+
+          delete_tags=$(jq -c '.deleteTags' <<<"$deletable_info")
+          delete_digests=$(jq -c '.deleteDigests' <<<"$deletable_info")
+          skipped_tags=$(jq -c '.skippedTags' <<<"$deletable_info")
+
+          echo "delete_tags=$delete_tags" >> "$GITHUB_OUTPUT"
+          echo "delete_digests=$delete_digests" >> "$GITHUB_OUTPUT"
+          echo "skipped_tags=$skipped_tags" >> "$GITHUB_OUTPUT"
+          echo "tag_count=$(jq 'length' <<<"$sorted_tags")" >> "$GITHUB_OUTPUT"
+          echo "delete_count=$(jq 'length' <<<"$delete_tags")" >> "$GITHUB_OUTPUT"
+          echo "delete_digest_count=$(jq 'length' <<<"$delete_digests")" >> "$GITHUB_OUTPUT"
+          echo "skip_count=$(jq 'length' <<<"$skipped_tags")" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Docker tag retention"
+            echo
+            echo "- Repository: ${IMAGE_NAME}"
+            echo "- Total tags found: $(jq 'length' <<<"$sorted_tags")"
+            echo "- Protected tags: ${PROTECTED_TAGS:-none}"
+            echo "- Tags selected for deletion: $(jq 'length' <<<"$delete_tags")"
+            echo "- Manifests selected for deletion: $(jq 'length' <<<"$delete_digests")"
+            echo "- Tags skipped because their manifest is still referenced by kept tags: $(jq 'length' <<<"$skipped_tags")"
+            echo
+            echo "#### Keeping"
+            jq -r --argjson keepers "$keepers" '.[] | select(.name as $tag | $keepers | index($tag)) | "- \(.name) (\(.last_updated))"' <<<"$sorted_tags"
+            echo
+            echo "#### Deleting"
+            jq -r --argjson deleteTags "$delete_tags" '.[] | select(.name as $tag | $deleteTags | index($tag)) | "- \(.name) (\(.last_updated))"' <<<"$sorted_tags"
+            if [[ $(jq 'length' <<<"$skipped_tags") -gt 0 ]]; then
+              echo
+              echo "#### Skipped"
+              jq -r '.[] | "- \(.name) shares \(.digest) with kept tags: \(.kept_refs | join(", "))"' <<<"$skipped_tags"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete old tags
+        if: steps.select.outputs.delete_digest_count != '0'
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DELETE_DIGESTS: ${{ steps.select.outputs.delete_digests }}
+          REGISTRY_TOKEN: ${{ steps.registry_auth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          jq -r '.[]' <<<"$DELETE_DIGESTS" | while IFS= read -r digest; do
+            [[ -n "$digest" ]] || continue
+            echo "Deleting ${IMAGE_NAME}@${digest}"
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $REGISTRY_TOKEN" \
+              "https://registry-1.docker.io/v2/${IMAGE_NAME}/manifests/${digest}"
+          done

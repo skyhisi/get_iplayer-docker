@@ -32,11 +32,11 @@ jobs:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           KEEP_COUNT: ${{ env.KEEP_COUNT }}
           PROTECTED_TAGS: ${{ env.PROTECTED_TAGS }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          DOCKERHUB_USERNAME="${IMAGE_NAME%%/*}"
           image_ref="docker://docker.io/${IMAGE_NAME}"
           creds="${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}"
 
@@ -129,11 +129,11 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DELETE_DIGESTS: ${{ steps.select.outputs.delete_digests }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          DOCKERHUB_USERNAME="${IMAGE_NAME%%/*}"
           creds="${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}"
 
           jq -r '.[]' <<<"$DELETE_DIGESTS" | while IFS= read -r digest; do

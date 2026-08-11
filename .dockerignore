@@ -1,4 +1,6 @@
+.actrc
 .git
 .github
+*.log
+justfile
 README.md
-

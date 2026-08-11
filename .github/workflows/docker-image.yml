@@ -28,8 +28,19 @@ jobs:
         id: timestamp
         run: echo "value=$(git log -1 --pretty=%ct)" >>$GITHUB_OUTPUT
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Get latest get_iplayer tag
+        id: get_iplayer_tag
+        run: |
+          set -euo pipefail
+          tag=$(git ls-remote --tags --refs https://github.com/get-iplayer/get_iplayer 'v*' \
+            | awk -F/ '{print $3}' \
+            | sort -V \
+            | tail -n1)
+          [[ -n "$tag" ]] || {
+            echo "Could not resolve latest get_iplayer tag" >&2
+            exit 1
+          }
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -56,17 +67,44 @@ jobs:
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
 
+      - name: Resolve build configuration
+        id: config
+        run: |
+          set -euo pipefail
+          if [[ "${ACT:-}" == "true" ]]; then
+            echo "cache_from=type=local,src=.buildx-cache" >> "$GITHUB_OUTPUT"
+            echo "cache_to=type=local,dest=.buildx-cache-new,mode=max" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+            echo "use_local_cache=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache_from=type=gha,scope=get-iplayer-docker" >> "$GITHUB_OUTPUT"
+            echo "cache_to=type=gha,mode=max,scope=get-iplayer-docker" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+            echo "use_local_cache=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@v7
         with:
           context: .
+          pull: true
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             base_tag=${{ env.BASE_TAG }}
-          platforms: linux/amd64,linux/arm64
+            get_iplayer_tag=${{ steps.get_iplayer_tag.outputs.value }}
+          cache-from: ${{ steps.config.outputs.cache_from }}
+          cache-to: ${{ steps.config.outputs.cache_to }}
+          platforms: ${{ steps.config.outputs.platforms }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
         env:
           SOURCE_DATE_EPOCH: ${{ steps.timestamp.outputs.value }}
+
+      - name: Finalize local build cache (act)
+        if: ${{ steps.config.outputs.use_local_cache == 'true' }}
+        run: |
+          set -euo pipefail
+          rm -rf .buildx-cache
+          mv .buildx-cache-new .buildx-cache

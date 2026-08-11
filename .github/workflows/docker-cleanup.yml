@@ -1,8 +1,6 @@
 ---
 name: Docker Cleanup
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 env:
@@ -22,47 +20,11 @@ jobs:
       contents: read
 
     steps:
-      - name: Create Docker Hub API token
-        id: hub_auth
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Install skopeo
         run: |
           set -euo pipefail
-
-          response=$(curl -fsSL -X POST https://hub.docker.com/v2/auth/token \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -cn --arg identifier \"$DOCKERHUB_USERNAME\" --arg secret \"$DOCKERHUB_TOKEN\" '{identifier: $identifier, secret: $secret}')")
-
-          token=$(jq -r '.access_token // empty' <<<"$response")
-          [[ -n "$token" ]] || {
-            echo "Failed to create Docker Hub API token" >&2
-            exit 1
-          }
-
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-
-      - name: Create Docker registry token
-        id: registry_auth
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-        run: |
-          set -euo pipefail
-
-          response=$(curl -fsSL --user "$DOCKERHUB_USERNAME:$DOCKERHUB_TOKEN" \
-            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_NAME}:pull,delete")
-
-          token=$(jq -r '.token // .access_token // empty' <<<"$response")
-          [[ -n "$token" ]] || {
-            echo "Failed to create Docker registry token" >&2
-            exit 1
-          }
-
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
 
       - name: Select tags to delete
         id: select
@@ -70,59 +32,52 @@ jobs:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           KEEP_COUNT: ${{ env.KEEP_COUNT }}
           PROTECTED_TAGS: ${{ env.PROTECTED_TAGS }}
-          DOCKERHUB_TOKEN: ${{ steps.hub_auth.outputs.token }}
-          REGISTRY_TOKEN: ${{ steps.registry_auth.outputs.token }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          accept_header='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+          DOCKERHUB_USERNAME="${IMAGE_NAME%%/*}"
+          image_ref="docker://docker.io/${IMAGE_NAME}"
+          creds="${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}"
 
-          api_url="https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags?page_size=100"
-          tags_json='[]'
+          tags_json=$(skopeo list-tags --creds "$creds" "$image_ref" | jq -c '.Tags // []')
 
-          while [[ -n "$api_url" && "$api_url" != "null" ]]; do
-            response=$(curl -fsSL "$api_url" \
-              -H "Authorization: Bearer $DOCKERHUB_TOKEN")
-            page_tags=$(jq -c '[.results[] | {name, last_updated}]' <<<"$response")
-            tags_json=$(jq -c --argjson current "$tags_json" --argjson page "$page_tags" '$current + $page' <<<"null")
-            api_url=$(jq -r '.next // empty' <<<"$response")
-          done
+          tag_entries='[]'
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
 
-          tags_with_digests=$(jq -c '[]' <<<"null")
-          while IFS= read -r tag_entry; do
-            tag_name=$(jq -r '.name' <<<"$tag_entry")
-            digest=$(curl -fsSI \
-              -H "Authorization: Bearer $REGISTRY_TOKEN" \
-              -H "Accept: ${accept_header}" \
-              "https://registry-1.docker.io/v2/${IMAGE_NAME}/manifests/${tag_name}" \
-              | tr -d '\r' \
-              | awk 'BEGIN { IGNORECASE = 1 } /^docker-content-digest:/ { print $2 }')
+            inspect_json=$(skopeo inspect --creds "$creds" "${image_ref}:${tag}")
+            raw_manifest_file=$(mktemp)
+            skopeo inspect --raw --creds "$creds" "${image_ref}:${tag}" > "$raw_manifest_file"
+            created=$(jq -r '.Created // empty' <<<"$inspect_json")
+            digest=$(skopeo manifest-digest "$raw_manifest_file")
+            rm -f "$raw_manifest_file"
 
-            [[ -n "$digest" ]] || {
-              echo "Failed to resolve digest for ${IMAGE_NAME}:${tag_name}" >&2
+            [[ -n "$created" && -n "$digest" ]] || {
+              echo "Failed to inspect ${IMAGE_NAME}:${tag}" >&2
               exit 1
             }
 
-            tags_with_digests=$(jq -c \
-              --argjson current "$tags_with_digests" \
-              --argjson tag "$tag_entry" \
+            tag_entries=$(jq -c \
+              --argjson current "$tag_entries" \
+              --arg name "$tag" \
+              --arg created "$created" \
               --arg digest "$digest" \
-              '$current + [$tag + {digest: $digest}]' <<<"null")
-          done < <(jq -c '.[]' <<<"$tags_json")
+              '$current + [{name: $name, created: $created, digest: $digest}]' <<<"null")
+          done < <(jq -r '.[]' <<<"$tags_json")
 
-          sorted_tags=$(jq -c 'sort_by(.last_updated) | reverse' <<<"$tags_with_digests")
+          sorted_tags=$(jq -c 'sort_by(.created) | reverse' <<<"$tag_entries")
           protected_tags=$(printf '%s\n' "$PROTECTED_TAGS" | sed '/^$/d' | jq -R . | jq -sc '.')
           keepers=$(jq -c --argjson keep_count "$KEEP_COUNT" --argjson protected "$protected_tags" '((.[0:$keep_count] | map(.name)) + $protected) | unique' <<<"$sorted_tags")
 
-          deletable_info=$(jq -c --argjson keepers "$keepers" '
+          deletion_plan=$(jq -c --argjson keepers "$keepers" '
             reduce .[] as $tag (
-              {deleteTags: [], deleteDigests: [], skippedTags: []};
-              .digestTags = ((.digestTags // {}) + {
-                ($tag.digest): (((.digestTags // {})[$tag.digest] // []) + [$tag.name])
-              })
+              {deleteTags: [], deleteDigests: [], skippedTags: [], digestTags: {}};
+              .digestTags[$tag.digest] = ((.digestTags[$tag.digest] // []) + [$tag.name])
             )
             | .digestTags as $digestTags
-            | reduce ($digestTags | to_entries[]) as $entry (.;
+            | reduce ($digestTags | to_entries[]) as $entry (
+                {deleteTags: [], deleteDigests: [], skippedTags: []};
                 ($entry.value | map(select(($keepers | index(.)) != null))) as $keptRefs
                 | ($entry.value | map(select(($keepers | index(.)) == null))) as $oldRefs
                 | if ($oldRefs | length) == 0 then .
@@ -136,15 +91,14 @@ jobs:
             | {deleteTags: (.deleteTags | unique), deleteDigests: (.deleteDigests | unique), skippedTags}
           ' <<<"$sorted_tags")
 
-          delete_tags=$(jq -c '.deleteTags' <<<"$deletable_info")
-          delete_digests=$(jq -c '.deleteDigests' <<<"$deletable_info")
-          skipped_tags=$(jq -c '.skippedTags' <<<"$deletable_info")
+          delete_tags=$(jq -c '.deleteTags' <<<"$deletion_plan")
+          delete_digests=$(jq -c '.deleteDigests' <<<"$deletion_plan")
+          skipped_tags=$(jq -c '.skippedTags' <<<"$deletion_plan")
 
           echo "delete_tags=$delete_tags" >> "$GITHUB_OUTPUT"
           echo "delete_digests=$delete_digests" >> "$GITHUB_OUTPUT"
           echo "skipped_tags=$skipped_tags" >> "$GITHUB_OUTPUT"
           echo "tag_count=$(jq 'length' <<<"$sorted_tags")" >> "$GITHUB_OUTPUT"
-          echo "delete_count=$(jq 'length' <<<"$delete_tags")" >> "$GITHUB_OUTPUT"
           echo "delete_digest_count=$(jq 'length' <<<"$delete_digests")" >> "$GITHUB_OUTPUT"
           echo "skip_count=$(jq 'length' <<<"$skipped_tags")" >> "$GITHUB_OUTPUT"
 
@@ -159,10 +113,10 @@ jobs:
             echo "- Tags skipped because their manifest is still referenced by kept tags: $(jq 'length' <<<"$skipped_tags")"
             echo
             echo "#### Keeping"
-            jq -r --argjson keepers "$keepers" '.[] | select(.name as $tag | $keepers | index($tag)) | "- \(.name) (\(.last_updated))"' <<<"$sorted_tags"
+            jq -r --argjson keepers "$keepers" '.[] | select(.name as $tag | $keepers | index($tag)) | "- \(.name) (\(.created))"' <<<"$sorted_tags"
             echo
             echo "#### Deleting"
-            jq -r --argjson deleteTags "$delete_tags" '.[] | select(.name as $tag | $deleteTags | index($tag)) | "- \(.name) (\(.last_updated))"' <<<"$sorted_tags"
+            jq -r --argjson deleteTags "$delete_tags" '.[] | select(.name as $tag | $deleteTags | index($tag)) | "- \(.name) (\(.created))"' <<<"$sorted_tags"
             if [[ $(jq 'length' <<<"$skipped_tags") -gt 0 ]]; then
               echo
               echo "#### Skipped"
@@ -175,14 +129,15 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DELETE_DIGESTS: ${{ steps.select.outputs.delete_digests }}
-          REGISTRY_TOKEN: ${{ steps.registry_auth.outputs.token }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          DOCKERHUB_USERNAME="${IMAGE_NAME%%/*}"
+          creds="${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}"
 
           jq -r '.[]' <<<"$DELETE_DIGESTS" | while IFS= read -r digest; do
             [[ -n "$digest" ]] || continue
             echo "Deleting ${IMAGE_NAME}@${digest}"
-            curl -fsSL -X DELETE \
-              -H "Authorization: Bearer $REGISTRY_TOKEN" \
-              "https://registry-1.docker.io/v2/${IMAGE_NAME}/manifests/${digest}"
+            skopeo delete --creds "$creds" "docker://docker.io/${IMAGE_NAME}@${digest}"
           done
